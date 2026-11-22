@@ -1,0 +1,9 @@
+# Scenario of the screenshots of copyparty-hildon in the emulated desktop (scripts/emu-shots.sh; demo data of hildon-run.sh).
+# SECONDS ACTION [ARGS]. The server of the demo is a stand-in that only opens the port.
+15  shot main
+16  click 400 125
+24  shot running
+25  click 400 285
+29  shot folders
+30  click 400 190
+36  shot folder-dialog

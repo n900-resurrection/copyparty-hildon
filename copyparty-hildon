@@ -1,0 +1,312 @@
+#!/opt/python3/bin/python3
+"""copyparty-hildon: settings of the file server of the N900 (package copyparty): the shared folders, the users, the port, and the switch that
+starts and stops the server. Python 3 + hildonlite; the settings are the file ~/.copyparty/share.conf (see copyparty_hildon.py)."""
+import faulthandler, gettext, os, sys
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+try:
+    import hildonlite as hl
+except ImportError:                       # in the repository: the copy of hildonlite next to this application
+    sys.path.insert(0, os.path.join(HERE, "..", "hildonlite"))
+    import hildonlite as hl
+import copyparty_hildon as C
+
+_ = gettext.gettext
+REMOVE = 1                                 # the response of the Remove button of a dialog
+LEVEL_KEYS = ["", "r", "rw"]
+LEVEL_TEXT = [_("No access"), _("Read"), _("Read and write")]
+
+
+def main():
+    try:                                   # errors and crashes go to a log (a program started from the menu has no terminal)
+        os.makedirs(C.DIR, exist_ok=True)
+        log = open(os.path.join(C.DIR, "hildon.log"), "w", buffering=1)
+        sys.stderr = log
+        faulthandler.enable(log)
+    except OSError:
+        pass
+    if not hl.init():
+        sys.exit("no X display")
+    if not os.path.exists(C.CONF):         # the first start: copyparty-share makes the default file (the same one the menu entry uses)
+        try:
+            C.share("config")
+        except C.Error:
+            pass
+    cfg = C.load()
+    win = hl.Window(_("File server"))
+    state = {"starting": 0}
+
+    def save():
+        """Write the settings; a running server is restarted to use them."""
+        C.save(cfg)
+        if C.server_pid():
+            try:
+                C.stop()
+                C.start()
+            except C.Error as e:
+                hl.info(win, str(e))
+            begin_wait(_("Restarting..."))
+            hl.Banner(win, _("Saved, the server restarts"))
+        else:
+            hl.Banner(win, _("Saved"))
+        refresh()
+
+    # ---- the main window ----
+    root = hl.VBox(spacing=6)
+    status = hl.Label("", markup=True, wrap=True, xalign=0.0)
+    toggle = hl.Button("", "", size=hl.THUMB)
+    addr = hl.Label("", wrap=True, xalign=0.0)
+    b_folders = hl.Button(_("Shared folders"), "", on_clicked=lambda b: folders_window())
+    b_users = hl.Button(_("Users and passwords"), "", on_clicked=lambda b: users_window())
+    b_port = hl.Button(_("Port"), "", on_clicked=lambda b: port_dialog())
+    note = hl.Label(_("The server speaks plain HTTP on every network connection of the phone: use it at home or on your own hotspot."), wrap=True, xalign=0.0)
+    for w in (status, toggle, addr, b_folders, b_users, b_port, note):
+        root.add(w)
+    area = hl.PannableArea()
+    area.add_viewport(root)
+    win.add(area)
+    for w in (status, addr, note):
+        w.set_size_request(770, -1)        # the width at which the text wraps
+
+    def refresh():
+        running = C.server_pid() is not None
+        if state["starting"]:
+            status.set_text(_("<big><b>Starting...</b></big>"), markup=True)
+            toggle.set_title(_("Please wait"))
+            toggle.set_sensitive(False)
+        else:
+            toggle.set_sensitive(True)
+            status.set_text(_("<big><b>The server is running</b></big>") if running else _("<big><b>The server is stopped</b></big>"), markup=True)
+            toggle.set_title(_("Stop the server") if running else _("Start the server"))
+        urls = C.addresses(cfg.port)
+        toggle.set_value((_("Open in the browser of your computer: ") + urls[0]) if running and urls else _("Shares the folders below on the network"))
+        if not urls:
+            addr.set_text(_("There is no network connection: join a Wi-Fi network first."))
+        else:
+            user = cfg.accounts[0][0] if cfg.accounts else "-"
+            addr.set_text(_("Address:") + " " + "  ".join(urls) + "\n" + _("User:") + " " + user)
+        b_folders.set_value(", ".join(v.name for v in cfg.volumes) or _("none"))
+        b_users.set_value(", ".join(cfg.users()) or _("none"))
+        b_port.set_value(str(cfg.port))
+
+    def begin_wait(text):
+        """The server needs a few seconds to open its port: wait for it without blocking the window."""
+        state["starting"] = 1
+        left = [40]
+
+        def poll():
+            left[0] -= 1
+            gone = left[0] < 35 and not C.server_pid()        # the process had 5 s to show up: it died on the start
+            if C.port_open(cfg.port) or left[0] <= 0 or gone:
+                state["starting"] = 0
+                refresh()
+                if not C.port_open(cfg.port):
+                    hl.Banner(win, _("The server did not start, see ~/.copyparty/server.log"))
+                return False
+            return True
+        refresh()
+        hl.timeout(1000, poll)
+
+    def on_toggle(_b):
+        try:
+            if C.server_pid():
+                C.stop()
+                refresh()
+            else:
+                if not cfg.volumes:
+                    hl.info(win, _("Add a shared folder first."))
+                    return
+                C.start()
+                begin_wait(_("Starting..."))
+        except C.Error as e:
+            hl.info(win, str(e))
+        refresh()
+    toggle.connect("clicked", on_toggle)
+
+    # ---- the port ----
+    def port_dialog():
+        d = hl.Dialog(_("Port"), win)
+        e = hl.Entry(str(cfg.port))
+        d.body.add(hl.Label(_("The port of the server (1024 to 65535); it is the number after the colon in the address."), wrap=True, xalign=0.0))
+        d.body.add(e)
+        d.add_button(_("Save"), hl.OK); d.add_button(_("Cancel"), hl.CANCEL)
+        d.show()
+        while True:
+            if d.run() != hl.OK:
+                break
+            try:
+                cfg.port = C.check_port(e.get_text().strip())
+            except C.Error as err:
+                hl.Banner(win, str(err)); d.show(); continue
+            save()
+            break
+        d.destroy()
+
+    # ---- the shared folders ----
+    def folders_window():
+        w = hl.Window(_("Shared folders"), quit_on_close=False)
+        box = hl.VBox(spacing=6)
+        store = hl.ListStore(2)
+        lv = hl.ListView(store)
+        pa = hl.PannableArea()
+        pa.add(lv)
+        box.add(hl.Button(_("Add a folder"), on_clicked=lambda b: edit_folder(None, reload)))
+        box.add(pa, expand=True)
+        box.add(hl.Label(_("Tap a folder to change who may use it or to remove it."), wrap=True, xalign=0.0))
+        w.add(box)
+
+        def reload():
+            store.clear()
+            for v in cfg.volumes:
+                store.append([v.name, "%s\n%s" % (v.path, C.summary(cfg, v))])
+            refresh()
+
+        def tapped(_w):
+            row = lv.selected()
+            if row:
+                edit_folder(row[0], reload)
+        lv.connect("row-activated", tapped)
+        reload()
+        w.show()
+
+    def edit_folder(name, after=None):
+        v = cfg.volume(name) if name else None
+        d = hl.Dialog(_("Shared folder") if v else _("New shared folder"), win)
+        content = hl.VBox(spacing=4)
+        e_name = hl.Entry(v.name if v else "/")
+        e_path = hl.Entry(v.path if v else os.path.join(C.HOME, "MyDocs"))
+        content.add(hl.Label(_("Address in the browser (/ is the top, /music is a folder under it)"), wrap=True, xalign=0.0)); content.add(e_name)
+        content.add(hl.Label(_("Folder on the phone"), wrap=True, xalign=0.0)); content.add(e_path)
+        common = C.common_folders()
+        if common:
+            def picked(p):
+                e_path.set_text(common[p.get_active()][1])
+            content.add(hl.PickerButton(_("Choose a folder"), [label for label, _p in common], 0, on_changed=picked))
+        pickers = {}
+        for user in ["*"] + cfg.users():
+            if v:
+                cur = v.level(user)
+            else:                           # a new folder: the first user may read and write, nobody else gets anything
+                cur = "rw" if cfg.users() and user == cfg.users()[0] else ""
+            pickers[user] = hl.PickerButton(_("Everybody (no login)") if user == "*" else user, LEVEL_TEXT, LEVEL_KEYS.index(cur))
+            content.add(pickers[user])
+        pa = hl.PannableArea()
+        pa.add_viewport(content)
+        pa.set_size_request(-1, 300)
+        d.body.add(pa)
+        d.add_button(_("Save"), hl.OK)
+        if v:
+            d.add_button(_("Remove"), REMOVE)
+        d.add_button(_("Cancel"), hl.CANCEL)
+        d.show()
+        while True:
+            r = d.run()
+            if r == REMOVE:
+                if hl.confirm(win, _("Stop sharing %s? The files stay on the phone.") % v.name):
+                    cfg.volumes.remove(v)
+                    break
+                d.show(); continue
+            if r != hl.OK:
+                d.destroy()
+                return
+            try:
+                new_name, new_path = C.check_volume(cfg, e_name.get_text(), e_path.get_text(), old=v.name if v else None)
+            except C.Error as err:
+                hl.Banner(win, str(err)); d.show(); continue
+            if pickers["*"].get_active() == 2 and (not v or v.level("*") != "rw"):
+                if not hl.confirm(win, _("Everybody on the network could change and delete files here without a password. Really?")):
+                    d.show(); continue
+            if v is None:
+                v = C.Volume()
+                cfg.volumes.append(v)
+            v.name, v.path = new_name, new_path
+            for user, pk in pickers.items():
+                v.set_level(user, LEVEL_KEYS[pk.get_active()])
+            break
+        d.destroy()
+        save()
+        if after:
+            after()
+
+    # ---- the users ----
+    def users_window():
+        w = hl.Window(_("Users and passwords"), quit_on_close=False)
+        box = hl.VBox(spacing=6)
+        store = hl.ListStore(2)
+        lv = hl.ListView(store)
+        pa = hl.PannableArea()
+        pa.add(lv)
+        box.add(hl.Button(_("Add a user"), on_clicked=lambda b: edit_user(None, reload)))
+        box.add(pa, expand=True)
+        box.add(hl.Label(_("The password is shown here so that you can type it on the computer. Tap a user to change it."), wrap=True, xalign=0.0))
+        w.add(box)
+
+        def reload():
+            store.clear()
+            for name, pw in cfg.accounts:
+                store.append([name, pw])
+            refresh()
+
+        def tapped(_w):
+            row = lv.selected()
+            if row:
+                edit_user(row[0], reload)
+        lv.connect("row-activated", tapped)
+        reload()
+        w.show()
+
+    def edit_user(name, after):
+        d = hl.Dialog(_("User") if name else _("New user"), win)
+        e_name = hl.Entry(name or "")
+        e_pw = hl.Entry(cfg.password(name) if name else C.random_password())
+        d.body.add(hl.Label(_("User name"), xalign=0.0)); d.body.add(e_name)
+        d.body.add(hl.Label(_("Password"), xalign=0.0)); d.body.add(e_pw)
+        d.body.add(hl.Button(_("Make a random password"), on_clicked=lambda b: e_pw.set_text(C.random_password())))
+        d.add_button(_("Save"), hl.OK)
+        if name:
+            d.add_button(_("Remove"), REMOVE)
+        d.add_button(_("Cancel"), hl.CANCEL)
+        d.show()
+        while True:
+            r = d.run()
+            if r == REMOVE:
+                if hl.confirm(win, _("Remove the user %s?") % name):
+                    C.remove_user(cfg, name)
+                    break
+                d.show(); continue
+            if r != hl.OK:
+                d.destroy()
+                return
+            try:
+                new = C.check_user(cfg, e_name.get_text().strip(), old=name)
+                pw = C.check_password(e_pw.get_text().strip())
+            except C.Error as err:
+                hl.Banner(win, str(err)); d.show(); continue
+            if name is None:
+                cfg.accounts.append([new, pw])
+            else:
+                C.rename_user(cfg, name, new)
+                for acc in cfg.accounts:
+                    if acc[0] == new:
+                        acc[1] = pw
+            break
+        d.destroy()
+        save()
+        after()
+
+    menu = hl.AppMenu()
+    menu.add(_("Shared folders"), lambda b: folders_window())
+    menu.add(_("Users and passwords"), lambda b: users_window())
+    menu.add(_("Port"), lambda b: port_dialog())
+    menu.add(_("About"), lambda b: hl.info(win, _("File server settings for the N900. The server is copyparty (MIT, by ed), the settings are in ~/.copyparty/share.conf.")))
+    win.set_menu(menu)
+    refresh()
+    win.show()
+    hl.timeout(3000, lambda: refresh() or True)          # the server can be started or stopped from the menu entry or a terminal, too
+    if os.environ.get("COPYPARTY_HILDON_TIMEOUT"):       # tests: quit after some seconds
+        hl.timeout(int(os.environ["COPYPARTY_HILDON_TIMEOUT"]) * 1000, lambda: hl.quit() or False)
+    hl.main()
+
+
+if __name__ == "__main__":
+    main()
